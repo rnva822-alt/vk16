@@ -1,0 +1,15 @@
+
+======================================================================
+Computing aggregated count/frequency/statistical features on combined train+test...
+======================================================================
+  content_owner_complaint_count: 23221 unique owners
+  content_complaint_count:       47797 unique contents
+  claim_type_count:              16 unique types
+  claim_reason_count:            18 unique reasons
+  Frequency encoding: 5 features (id_content_owner, claim_type, claim_reason, os, registered_phone_country)
+  Statistical aggregations: 5 features (mean/std bot scores, mean likes by claim_type/reason)
+{"half_life_days": 75, "l2_leaf_reg": 3, "seed": 42, "f1": 0.4374167776298269, "threshold": 0.47200000000000003, "weight_cat_all": 0.1, "weight_cat_recent": 0.5, "weight_lgb_idte": 0.4, "positive_rate": 0.2218522629177457, "positive_predictions": 1799, "best_iteration_recency": 142, "baseline_cat_all_iteration": 232, "baseline_lgb_iteration": 15, "timestamp_utc": "2026-08-13T15:43:21.413337+00:00"}
+
+TOP 20
+ half_life_days  l2_leaf_reg  seed       f1  threshold  weight_cat_all  weight_cat_recent  weight_lgb_idte  positive_rate  positive_predictions  best_iteration_recency  baseline_cat_all_iteration  baseline_lgb_iteration                    timestamp_utc
+             75            3    42 0.437417      0.472             0.1                0.5              0.4       0.221852                  1799                     142                         232                      15 2026-08-13T15:43:21.413337+00:00

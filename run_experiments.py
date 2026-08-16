@@ -12,7 +12,7 @@ from catboost import CatBoostClassifier
 from sklearn.metrics import f1_score, precision_score, recall_score
 from sklearn.model_selection import KFold, TimeSeriesSplit
 
-import solution as sol
+import vk_pipeline_core as sol
 
 warnings.filterwarnings("ignore")
 
@@ -61,10 +61,8 @@ def make_split_features(raw_train: pd.DataFrame, raw_val: pd.DataFrame, agg_maps
     base_train = sol.engineer_features(raw_train, agg_maps)
     base_val = sol.engineer_features(raw_val, agg_maps)
     base_train = sol.kfold_target_encoding(base_train, "is_valid", sol.TE_ALPHA)
-    base_val = sol.apply_te_to_new_data(base_train.drop(columns=[c for c in ["claim_type_te", "claim_reason_start_te", "claim_user_registered_phone_country_id_te", "platform_te"] if c in base_train]), base_val, "is_valid", sol.TE_ALPHA)
-
-    # The previous line needs mappings from the raw engineered training frame; re-create them directly.
-    base_val = sol.apply_te_to_new_data(sol.engineer_features(raw_train, agg_maps), base_val, "is_valid", sol.TE_ALPHA)
+    # Validation TE must come from the training block without leaking validation targets.
+    base_val = sol.apply_te_to_new_data(base_train, base_val, "is_valid", sol.TE_ALPHA)
 
     te_cols = ["id_content_owner", "id_content", "owner_claim_type_key", "owner_reason_key"]
     raw_te_train, raw_te_val = oof_target_encode(train_with_keys, val_with_keys, te_cols)

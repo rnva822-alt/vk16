@@ -1,0 +1,34 @@
+
+======================================================================
+Computing aggregated count/frequency/statistical features on combined train+test...
+======================================================================
+  content_owner_complaint_count: 23221 unique owners
+  content_complaint_count:       47797 unique contents
+  claim_type_count:              16 unique types
+  claim_reason_count:            18 unique reasons
+  Frequency encoding: 5 features (id_content_owner, claim_type, claim_reason, os, registered_phone_country)
+  Statistical aggregations: 5 features (mean/std bot scores, mean likes by claim_type/reason)
+FINAL: full train -> test.csv
+    cat_all: iterations=362 (76.9s)
+    cat_recent: iterations=382 (82.0s)
+    lgb_neutral: iterations=432 (10.0s)
+    lgb_diverse: iterations=1483 (31.9s)
+{
+  "rows_train": 48658,
+  "rows_test": 7446,
+  "seeds": [
+    42,
+    2026,
+    777
+  ],
+  "cat_all_iterations": 362,
+  "cat_all_seconds": 76.9,
+  "cat_recent_iterations": 382,
+  "cat_recent_seconds": 82.0,
+  "lgb_neutral_iterations": 432,
+  "lgb_neutral_seconds": 10.0,
+  "lgb_diverse_iterations": 1483,
+  "lgb_diverse_seconds": 31.9
+}
+submission.csv written with positives=1782, k=1782
+solution_rc=0

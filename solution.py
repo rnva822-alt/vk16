@@ -1,80 +1,29 @@
-"""
-VK Competition Solution: Binary Classification for `is_valid` Prediction
-========================================================================
+"""Reproducible VK tabular solution: feature engineering, training, and submission."""
 
-Task: Predict whether a complaint is valid (is_valid=1) or rejected (is_valid=0).
-Metric: F1 score for the positive class (is_valid=1).
+from __future__ import annotations
 
-Approach:
----------
-1. Feature Engineering:
-   - Temporal features from first_event_time and content_registered_time
-     (useful: complaint timing patterns differ by hour, day, weekend)
-   - Account age features (older accounts may behave differently)
-   - Bot score interactions (bot-like behavior correlates with invalid complaints)
-   - Country match features (mismatched countries may indicate fraud)
-   - Ordinal encoding for age_bucket and friends_bucket
-   - Aggregated count features (computed on combined train+test to avoid leakage;
-     useful: repeat offenders and frequently-complained content patterns)
-   - K-fold target encoding (prevents leakage — each row's TE computed from other folds)
-   - Log-transformed skewed counters (stabilizes variance of count features)
-   - Interaction features (claim_type × reason, sex match, age/friends diff)
-
-2. Validation: 5-fold TimeSeriesSplit cross-validation with OOF predictions
-   - Temporal data requires time-based validation (simulates production deployment)
-   - OOF predictions pooled across folds for threshold/weight optimization;
-     LAST-FOLD weights/threshold used for final submission (most test-representative)
-
-3. Models: Ensemble of CatBoost + LightGBM + XGBoost
-   - Gradient boosted trees are chosen because they excel at tabular data with
-     mixed types (categorical + numerical), capture non-linear interactions
-     automatically, and are robust to outliers and feature scale differences.
-   - Three models provide ensemble diversity: CatBoost uses ordered boosting
-     (reduces overfitting on small data), LightGBM uses leaf-wise growth
-     (efficient on large data), XGBoost uses level-wise growth (stable).
-     Their different splitting strategies produce complementary error patterns.
-
-4. Threshold Optimization: Scan 0.05-0.95; optimize on both pooled OOF and last fold
-
-5. Ensemble: Weighted probability averaging with grid-searched weights;
-   also compares against rank averaging; final submission uses LAST-FOLD
-   weights/threshold (most representative of test conditions)
-
-6. Final Model: Retrain on full train data using best_iteration from last CV fold,
-   average predictions, apply last-fold optimized threshold + rate calibration
-
-Usage:
-    cd /Users/artem/Documents/VK && python3 solution.py
-    (Dependencies: pip install catboost lightgbm xgboost scipy scikit-learn pandas numpy)
-"""
-
-# ============================================================================
-# Section 1: Imports & Constants
-# ============================================================================
-
-import warnings
 import json
+import joblib
 import time
-import datetime
+import warnings
+from pathlib import Path
+
+import lightgbm as lgb
 import numpy as np
 import pandas as pd
 from catboost import CatBoostClassifier
-import lightgbm as lgb
-import xgboost as xgb
-from sklearn.metrics import f1_score, roc_auc_score
-from sklearn.model_selection import TimeSeriesSplit, KFold
-from sklearn.linear_model import LogisticRegression
-from scipy.stats import rankdata
+from sklearn.model_selection import KFold
 
 warnings.filterwarnings("ignore")
-
+ROOT = Path(__file__).resolve().parent
 RANDOM_SEED = 42
-np.random.seed(RANDOM_SEED)
+N_SPLITS = 5
 
-# Target encoding smoothing parameter — higher alpha = more shrinkage toward global mean
+# Two smoothing values are retained from the original pipelines: 10 for column TE,
+# 15 for entity-level OOF TE.
 TE_ALPHA = 10
+RAW_TE_ALPHA = 15.0
 
-# Columns for target encoding (high-cardinality categoricals where TE adds signal)
 TE_COLUMNS = [
     "claim_type",
     "claim_reason_start",
@@ -82,25 +31,26 @@ TE_COLUMNS = [
     "platform",
 ]
 
-# Ordinal encoding maps (preserve natural ordering of bucketed features)
+
 AGE_MAP = {
     "0_13": 0, "14_17": 1, "18_24": 2, "25_34": 3,
     "35_44": 4, "45_54": 5, "55_64": 6, "65_plus": 7,
 }
+
 
 FRIENDS_MAP = {
     "0": 0, "1_5": 1, "6_20": 2, "21_50": 3, "51_100": 4,
     "101_250": 5, "251_500": 6, "501_1000": 7, "1001_plus": 8,
 }
 
-# Columns to drop after feature engineering (IDs, raw datetimes, original bucket strings)
+
 DROP_COLS = [
     "claim_id", "id_content", "first_event_time", "content_registered_time",
     "ip_country_id", "id_content_owner", "age_bucket", "claim_user_age_bucket",
     "friends_bucket", "claim_user_friends_bucket",
 ]
 
-# Categorical columns (for CatBoost cat_features and LGB/XGB category dtype)
+
 CAT_FEATURES = [
     "os", "platform", "sex", "claim_user_sex",
     "claim_type", "claim_reason_start",
@@ -109,114 +59,9 @@ CAT_FEATURES = [
     "claim_type_reason",
 ]
 
-# String categorical columns needing label encoding for LGB/XGB
+
 STRING_CAT_COLS = ["os", "claim_type_reason"]
 
-# scale_pos_weight rationale: positive rate ≈ 14.35%, so neg/pos ≈ 5.96 ≈ 6.
-# This balances gradient updates for the minority (positive) class.
-SCALE_POS_WEIGHT = 6
-
-
-# ============================================================================
-# Section 2: Data Loading
-# ============================================================================
-
-def load_data():
-    """Load train and test data, sort train by first_event_time."""
-    print("=" * 70)
-    print("Loading data...")
-    print("=" * 70)
-
-    train = pd.read_csv("train.csv")
-    test = pd.read_csv("test.csv")
-
-    print(f"Train shape: {train.shape}")
-    print(f"Test shape:  {test.shape}")
-    print(f"Target distribution:\n{train['is_valid'].value_counts(normalize=True)}")
-
-    # Sort train by first_event_time for time-based cross-validation
-    train = train.sort_values("first_event_time").reset_index(drop=True)
-    print(f"\nTrain time range: {train['first_event_time'].min()} to {train['first_event_time'].max()}")
-    print(f"Test time range:  {test['first_event_time'].min()} to {test['first_event_time'].max()}")
-
-    return train, test
-
-
-# ============================================================================
-# Section 3: EDA
-# ============================================================================
-
-def eda(train, test):
-    """Exploratory Data Analysis — print key statistics and distribution checks."""
-    print("\n" + "=" * 70)
-    print("EDA: Exploratory Data Analysis")
-    print("=" * 70)
-
-    # --- Missing values ---
-    print("\n--- Missing Values ---")
-    train_missing = train.isnull().sum()
-    test_missing = test.isnull().sum()
-    print(f"Train: {train_missing.sum()} total missing ({(train_missing > 0).sum()} columns with missing)")
-    print(f"Test:  {test_missing.sum()} total missing ({(test_missing > 0).sum()} columns with missing)")
-    if train_missing.sum() > 0:
-        print("Columns with missing in train:")
-        print(train_missing[train_missing > 0].to_string())
-
-    # --- Numeric feature summary ---
-    print("\n--- Numeric Feature Summary (train describe) ---")
-    numeric_cols = train.select_dtypes(include=[np.number]).columns.tolist()
-    print(train[numeric_cols].describe().T[["mean", "std", "min", "50%", "max"]].round(3).to_string())
-
-    # --- Target rate by key categorical features ---
-    print("\n--- Target Rate by Key Categorical Features ---")
-    for col in ["claim_type", "claim_reason_start", "platform", "age_bucket", "os"]:
-        if col in train.columns:
-            rate = train.groupby(col)["is_valid"].agg(["mean", "count"]).sort_values("mean", ascending=False)
-            print(f"\n  {col} (sorted by target rate):")
-            print(rate.to_string())
-
-    # --- Bot score distribution by target ---
-    print("\n--- Bot Score Distribution by Target ---")
-    for col in ["user_bot_prediction_score", "claim_user_bot_prediction_score"]:
-        if col in train.columns:
-            print(f"\n  {col}:")
-            print(train.groupby("is_valid")[col].describe().round(4).to_string())
-
-    # --- Class imbalance ---
-    print("\n--- Class Imbalance Summary ---")
-    counts = train["is_valid"].value_counts()
-    print(f"  is_valid=0 (rejected): {counts[0]:,} ({counts[0] / len(train):.2%})")
-    print(f"  is_valid=1 (valid):    {counts[1]:,} ({counts[1] / len(train):.2%})")
-    print(f"  Imbalance ratio (neg/pos): {counts[0] / counts[1]:.2f}:1")
-    print(f"  scale_pos_weight = {SCALE_POS_WEIGHT} (≈ 1 / {counts[1] / len(train):.4f})")
-
-    # --- Train vs test feature distribution comparison ---
-    print("\n--- Train vs Test Feature Distribution (numeric mean comparison) ---")
-    common_numeric = [c for c in numeric_cols if c in test.columns and c != "is_valid"]
-    comparison = pd.DataFrame({
-        "train_mean": train[common_numeric].mean(),
-        "test_mean": test[common_numeric].mean(),
-    })
-    comparison["abs_diff"] = (comparison["train_mean"] - comparison["test_mean"]).abs()
-    comparison["diff_pct"] = (comparison["abs_diff"] / comparison["train_mean"].abs() * 100).round(2)
-    comparison = comparison.sort_values("diff_pct", ascending=False)
-    print(comparison.round(4).to_string())
-
-    # --- Temporal split ---
-    print("\n--- Temporal Split ---")
-    print(f"  Train time range: {train['first_event_time'].min()} to {train['first_event_time'].max()}")
-    print(f"  Test time range:  {test['first_event_time'].min()} to {test['first_event_time'].max()}")
-    train_end = pd.to_datetime(train["first_event_time"]).max()
-    test_start = pd.to_datetime(test["first_event_time"]).min()
-    if test_start >= train_end:
-        print(f"  -> Test starts AFTER train ends (strict temporal split, no overlap)")
-    else:
-        print(f"  -> WARNING: Train and test time ranges overlap!")
-
-
-# ============================================================================
-# Section 4: Aggregated Count Features (computed on combined train+test)
-# ============================================================================
 
 def compute_agg_counts(train, test):
     """Compute aggregated count, frequency, and statistical features on combined train+test.
@@ -258,15 +103,11 @@ def compute_agg_counts(train, test):
     print(f"  content_complaint_count:       {len(agg_mappings['content_complaint_count'])} unique contents")
     print(f"  claim_type_count:              {len(agg_mappings['claim_type_count'])} unique types")
     print(f"  claim_reason_count:            {len(agg_mappings['claim_reason_count'])} unique reasons")
-    print(f"  Frequency encoding: 5 features (id_content_owner, claim_type, claim_reason, os, registered_phone_country)")
-    print(f"  Statistical aggregations: 5 features (mean/std bot scores, mean likes by claim_type/reason)")
+    print("  Frequency encoding: 5 features (id_content_owner, claim_type, claim_reason, os, registered_phone_country)")
+    print("  Statistical aggregations: 5 features (mean/std bot scores, mean likes by claim_type/reason)")
 
     return agg_mappings
 
-
-# ============================================================================
-# Section 5: Feature Engineering
-# ============================================================================
 
 def engineer_features(df, agg_mappings):
     """Perform all feature engineering on a dataframe.
@@ -393,10 +234,6 @@ def engineer_features(df, agg_mappings):
     return df
 
 
-# ============================================================================
-# Section 6: Target Encoding (K-Fold, leakage-free)
-# ============================================================================
-
 def kfold_target_encoding(train_df, target_col="is_valid", alpha=TE_ALPHA,
                            n_splits=5, random_state=RANDOM_SEED):
     """Apply K-fold target encoding to training data to prevent leakage.
@@ -444,1185 +281,277 @@ def apply_te_to_new_data(train_df, new_df, target_col="is_valid", alpha=TE_ALPHA
     return new_df
 
 
-# ============================================================================
-# Section 7: Label Encoding & Categorical Preparation
-# ============================================================================
-
-def compute_label_mappings(train_fe, test_fe):
-    """Compute label encoding mappings for string categorical columns.
-
-    Mappings are computed on combined train+test to handle all categories.
-    """
-    label_mappings = {}
-    for col in STRING_CAT_COLS:
-        combined_vals = pd.concat([train_fe[col], test_fe[col]], ignore_index=True).unique()
-        label_mappings[col] = {v: i for i, v in enumerate(combined_vals)}
-    return label_mappings
+def add_raw_keys(df: pd.DataFrame) -> pd.DataFrame:
+    out = df.copy()
+    out["owner_claim_type_key"] = out["id_content_owner"].astype(str) + "__" + out["claim_type"].astype(str)
+    out["owner_reason_key"] = out["id_content_owner"].astype(str) + "__" + out["claim_reason_start"].astype(str)
+    return out
 
 
-def prepare_for_lgb_xgb(df, label_mappings, cast_category=True):
-    """Prepare dataframe for LightGBM/XGBoost: label-encode strings, optionally cast cats.
+def oof_target_encode(train_raw: pd.DataFrame, val_raw: pd.DataFrame, columns: list[str]) -> tuple[pd.DataFrame, pd.DataFrame]:
+    tr = train_raw.copy()
+    va = val_raw.copy()
+    global_mean = float(tr["is_valid"].mean())
+    kf = KFold(n_splits=N_SPLITS, shuffle=True, random_state=RANDOM_SEED)
+    for col in columns:
+        name = f"{col}_te"
+        oof = np.full(len(tr), global_mean, dtype=float)
+        for fit_idx, hold_idx in kf.split(tr):
+            fit = tr.iloc[fit_idx]
+            stats = fit.groupby(col)["is_valid"].agg(["sum", "count"])
+            mapping = ((stats["sum"] + RAW_TE_ALPHA * global_mean) / (stats["count"] + RAW_TE_ALPHA)).to_dict()
+            oof[hold_idx] = tr.iloc[hold_idx][col].map(mapping).fillna(global_mean).to_numpy()
+        stats_full = tr.groupby(col)["is_valid"].agg(["sum", "count"])
+        mapping_full = ((stats_full["sum"] + RAW_TE_ALPHA * global_mean) / (stats_full["count"] + RAW_TE_ALPHA)).to_dict()
+        tr[name] = oof
+        va[name] = va[col].map(mapping_full).fillna(global_mean).to_numpy()
 
-    LightGBM natively handles 'category' dtype columns, which lets it learn
-    optimal splits on categorical values rather than treating them as
-    continuous integers.
-
-    XGBoost 2.1.4 has issues with enable_categorical=True combined with
-    high-cardinality categoricals and scale_pos_weight, so for XGBoost we
-    pass cast_category=False to keep all features numeric.
-    """
-    df = df.copy()
-    # Label-encode string categorical columns to integers
-    for col in STRING_CAT_COLS:
-        if col in df.columns:
-            df[col] = df[col].map(label_mappings[col]).fillna(-1).astype(int)
-    if cast_category:
-        # Cast all categorical columns to category dtype for native LightGBM handling
-        for col in CAT_FEATURES:
-            if col in df.columns:
-                df[col] = df[col].astype("category")
-    return df
-
-
-def prepare_for_catboost(df):
-    """Convert categorical columns to string for CatBoost.
-
-    CatBoost handles unknown categories natively via its encoding scheme.
-    """
-    df = df.copy()
-    for col in CAT_FEATURES:
-        if col in df.columns:
-            df[col] = df[col].astype(str)
-    return df
+        count_name = f"{col}_history_count"
+        count_map = tr.groupby(col).size().to_dict()
+        tr[count_name] = tr[col].map(count_map).astype(float)
+        va[count_name] = va[col].map(count_map).fillna(0).astype(float)
+    return tr, va
 
 
-# ============================================================================
-# Section 8: Threshold Optimization
-# ============================================================================
+def make_split_features(raw_train: pd.DataFrame, raw_val: pd.DataFrame, agg_maps: dict) -> tuple[pd.DataFrame, pd.DataFrame]:
+    train_with_keys = add_raw_keys(raw_train)
+    val_with_keys = add_raw_keys(raw_val)
 
-def optimize_threshold(y_true, y_proba, label=""):
-    """Scan thresholds from 0.05 to 0.95 to maximize F1 score."""
-    best_threshold = 0.5
-    best_f1 = 0.0
+    base_train = engineer_features(raw_train, agg_maps)
+    base_val = engineer_features(raw_val, agg_maps)
+    base_train = kfold_target_encoding(base_train, "is_valid", TE_ALPHA)
+    base_val = apply_te_to_new_data(engineer_features(raw_train, agg_maps), base_val, "is_valid", TE_ALPHA)
 
-    for threshold in np.arange(0.05, 0.95, 0.01):
-        y_pred = (y_proba >= threshold).astype(int)
-        f1 = f1_score(y_true, y_pred, zero_division=0)
-        if f1 > best_f1:
-            best_f1 = f1
-            best_threshold = threshold
+    te_cols = ["id_content_owner", "id_content", "owner_claim_type_key", "owner_reason_key"]
+    raw_te_train, raw_te_val = oof_target_encode(train_with_keys, val_with_keys, te_cols)
+    for col in te_cols:
+        for suffix in ["_te", "_history_count"]:
+            feature = f"{col}{suffix}"
+            base_train[feature] = raw_te_train[feature].to_numpy()
+            base_val[feature] = raw_te_val[feature].to_numpy()
 
-    print(f"  {label:25s} | Best F1: {best_f1:.4f} | Threshold: {best_threshold:.2f}")
-    return best_threshold, best_f1
+    train_dt = pd.to_datetime(raw_train["first_event_time"])
+    val_dt = pd.to_datetime(raw_val["first_event_time"])
+    origin = train_dt.min()
+    base_train["event_elapsed_days"] = (train_dt - origin).dt.total_seconds().to_numpy() / 86400.0
+    base_val["event_elapsed_days"] = (val_dt - origin).dt.total_seconds().to_numpy() / 86400.0
 
+    base_train["owner_seen_before"] = 1
+    base_val["owner_seen_before"] = raw_val["id_content_owner"].isin(set(raw_train["id_content_owner"])).astype(int).to_numpy()
+    base_train["content_seen_before"] = 1
+    base_val["content_seen_before"] = raw_val["id_content"].isin(set(raw_train["id_content"])).astype(int).to_numpy()
 
-# ============================================================================
-# Section 8b: Ensemble Optimization (Weighted Grid Search)
-# ============================================================================
+    # Raw identifiers are kept separately for native-CatBoost experiments only.
+    base_train["owner_id_cat"] = raw_train["id_content_owner"].astype(str).to_numpy()
+    base_val["owner_id_cat"] = raw_val["id_content_owner"].astype(str).to_numpy()
+    base_train["content_id_cat"] = raw_train["id_content"].astype(str).to_numpy()
+    base_val["content_id_cat"] = raw_val["id_content"].astype(str).to_numpy()
 
-def optimize_ensemble(val_preds_dict, val_y):
-    """Grid search over ensemble weights and thresholds to maximize F1.
-
-    Tries all weight combinations (w_cat, w_lgb, w_xgb) where each weight
-    ranges from 0.0 to 1.0 in steps of 0.1 and they sum to 1.0.
-    """
-    model_names = list(val_preds_dict.keys())
-    n_models = len(model_names)
-    pred_arrays = [np.asarray(val_preds_dict[name], dtype=np.float64) for name in model_names]
-    val_y = np.asarray(val_y)
-
-    thresholds = np.arange(0.05, 0.95, 0.01)
-    steps = 10
-
-    weight_grid = []
-    for w0 in range(steps + 1):
-        for w1 in range(steps + 1 - w0):
-            w2 = steps - w0 - w1
-            weight_grid.append((w0 / steps, w1 / steps, w2 / steps))
-
-    results = []
-    for weights in weight_grid:
-        weighted_proba = np.zeros_like(pred_arrays[0])
-        for w, p in zip(weights, pred_arrays):
-            weighted_proba += w * p
-
-        best_thr = 0.5
-        best_f1_w = 0.0
-        for thr in thresholds:
-            y_pred = (weighted_proba >= thr).astype(int)
-            f1 = f1_score(val_y, y_pred, zero_division=0)
-            if f1 > best_f1_w:
-                best_f1_w = f1
-                best_thr = float(thr)
-
-        weights_dict = {model_names[i]: weights[i] for i in range(n_models)}
-        results.append((weights_dict, best_thr, best_f1_w))
-
-    results.sort(key=lambda x: x[2], reverse=True)
-    best_weights, best_threshold, best_f1 = results[0]
-    top_configs = results[:5]
-
-    return best_weights, best_threshold, best_f1, top_configs
+    return base_train, base_val
 
 
-def rank_average(preds_dict):
-    """Convert each model's probabilities to ranks, average, normalize to [0, 1].
-
-    Rank averaging is robust to miscalibrated probabilities — it only relies
-    on the relative ordering each model produces.
-    """
-    model_names = list(preds_dict.keys())
-    n = len(preds_dict[model_names[0]])
-    rank_sum = np.zeros(n, dtype=np.float64)
-    for name in model_names:
-        rank_sum += rankdata(preds_dict[name])
-    avg_rank = rank_sum / len(model_names)
-    denom = avg_rank.max() - avg_rank.min()
-    if denom < 1e-12:
-        return avg_rank
-    return (avg_rank - avg_rank.min()) / denom
+def prepare_cat(df: pd.DataFrame, columns: list[str], cat_columns: list[str]) -> pd.DataFrame:
+    out = df[columns].copy()
+    for col in cat_columns:
+        if col in out:
+            out[col] = out[col].astype(str)
+    return out
 
 
-# ============================================================================
-# Section 9: Model Training (on validation fold)
-# ============================================================================
-
-def train_catboost(X_train, y_train, X_val, y_val, cat_features, quiet=False):
-    """Train CatBoost classifier with early stopping."""
-    model = CatBoostClassifier(
-        iterations=2000,
-        learning_rate=0.03,
-        depth=7,
-        loss_function="Logloss",
-        eval_metric="Logloss",
-        auto_class_weights="Balanced",
-        random_seed=RANDOM_SEED,
-        verbose=False if quiet else 200,
-        early_stopping_rounds=150,
-        cat_features=cat_features,
-    )
-    model.fit(X_train, y_train, eval_set=(X_val, y_val), use_best_model=True)
-    return model
+def encode_lgb(train: pd.DataFrame, val: pd.DataFrame, feature_cols: list[str], cat_cols: list[str]) -> tuple[pd.DataFrame, pd.DataFrame, list[str]]:
+    tr = train[feature_cols].copy()
+    va = val[feature_cols].copy()
+    valid_cats = [c for c in cat_cols if c in feature_cols]
+    for col in valid_cats:
+        values = pd.concat([tr[col], va[col]], ignore_index=True).astype(str).unique()
+        mapping = {v: i for i, v in enumerate(values)}
+        tr[col] = tr[col].astype(str).map(mapping).astype("category")
+        va[col] = va[col].astype(str).map(mapping).astype("category")
+    return tr, va, valid_cats
 
 
-def train_lightgbm(X_train, y_train, X_val, y_val, categorical_feature=None, quiet=False):
-    """Train LightGBM classifier with early stopping."""
-    model = lgb.LGBMClassifier(
-        n_estimators=2000,
-        learning_rate=0.03,
-        max_depth=7,
-        num_leaves=63,
-        min_child_samples=20,
-        subsample=0.8,
-        colsample_bytree=0.8,
-        scale_pos_weight=SCALE_POS_WEIGHT,
-        objective="binary",
-        metric="auc",
-        random_state=RANDOM_SEED,
-        verbose=-1,
-    )
-    callbacks = [lgb.early_stopping(stopping_rounds=100, verbose=not quiet)]
-    if not quiet:
-        callbacks.append(lgb.log_evaluation(200))
-    model.fit(
-        X_train, y_train,
-        eval_set=[(X_val, y_val)],
-        categorical_feature=categorical_feature,
-        callbacks=callbacks,
-    )
-    return model
-
-
-def train_xgboost(X_train, y_train, X_val, y_val, quiet=False):
-    """Train XGBoost classifier with early stopping.
-
-    Note: enable_categorical is NOT used. XGBoost 2.1.4 has issues with
-    high-cardinality category dtype + scale_pos_weight, compressing all
-    probabilities below 0.5. All features are treated as numeric.
-    """
-    model = xgb.XGBClassifier(
-        n_estimators=2000,
-        learning_rate=0.03,
-        max_depth=7,
-        subsample=0.8,
-        colsample_bytree=0.8,
-        scale_pos_weight=SCALE_POS_WEIGHT,
-        objective="binary:logistic",
-        eval_metric="logloss",
-        random_state=RANDOM_SEED,
-        early_stopping_rounds=150,
-    )
-    model.fit(X_train, y_train, eval_set=[(X_val, y_val)], verbose=False if quiet else 200)
-    return model
-
-
-def get_best_iterations(cb_model, lgb_model, xgb_model, quiet=False):
-    """Extract best iteration from each model for final training.
-
-    CatBoost and XGBoost use 0-indexed best_iteration, so we add 1 to get
-    the number of trees to train. LightGBM's best_iteration_ is already
-    1-indexed (equals the number of trees retained), so NO +1 is needed.
-    """
-    # CatBoost: get_best_iteration() is 0-indexed
-    cb_best = cb_model.get_best_iteration()
-    if cb_best is None:
-        cb_best = 1999
-    cb_best = int(cb_best) + 1
-
-    # LightGBM: best_iteration_ is 1-indexed (number of trees used) — NO +1
-    lgb_best = lgb_model.best_iteration_
-    if lgb_best is None:
-        lgb_best = 2000
-    lgb_best = int(lgb_best)
-
-    # XGBoost: best_iteration is 0-indexed
-    xgb_best = xgb_model.best_iteration
-    if xgb_best is None:
-        xgb_best = 1999
-    xgb_best = int(xgb_best) + 1
-
-    if not quiet:
-        print(f"\n  Best iterations — CatBoost: {cb_best}, LightGBM: {lgb_best}, XGBoost: {xgb_best}")
-    return cb_best, lgb_best, xgb_best
-
-
-# ============================================================================
-# Section 9b: Hyperparameter Tuning (on last CV fold)
-# ============================================================================
-
-def tune_catboost(X_train, y_train, X_val, y_val, cat_features):
-    """Grid search CatBoost hyperparameters on the last CV fold.
-
-    Tries 8 combinations of depth, learning_rate, and l2_leaf_reg.
-    Each config is trained with 500 iterations (fast) and early stopping.
-    Returns the best params and their F1 score.
-    """
-    param_grid = [
-        {"depth": 6, "learning_rate": 0.02, "l2_leaf_reg": 3},
-        {"depth": 6, "learning_rate": 0.05, "l2_leaf_reg": 5},
-        {"depth": 7, "learning_rate": 0.02, "l2_leaf_reg": 7},
-        {"depth": 7, "learning_rate": 0.03, "l2_leaf_reg": 3},
-        {"depth": 7, "learning_rate": 0.05, "l2_leaf_reg": 5},
-        {"depth": 8, "learning_rate": 0.02, "l2_leaf_reg": 3},
-        {"depth": 8, "learning_rate": 0.03, "l2_leaf_reg": 5},
-        {"depth": 8, "learning_rate": 0.05, "l2_leaf_reg": 7},
+def base_columns(frame: pd.DataFrame) -> tuple[list[str], list[str], list[str]]:
+    no_id = [c for c in frame.columns if c not in ["is_valid", "owner_id_cat", "content_id_cat"]]
+    id_bases = {"id_content_owner", "id_content", "owner_claim_type_key", "owner_reason_key"}
+    cat_features = [
+        c for c in no_id
+        if not (
+            c.endswith("_history_count")
+            or (c.endswith("_te") and c.split("_te")[0] in id_bases)
+            or c in {"owner_seen_before", "content_seen_before", "event_elapsed_days"}
+        )
     ]
-
-    best_f1 = 0.0
-    best_params = param_grid[3]  # default (close to current)
-
-    for i, params in enumerate(param_grid):
-        model = CatBoostClassifier(
-            iterations=500,
-            learning_rate=params["learning_rate"],
-            depth=params["depth"],
-            l2_leaf_reg=params["l2_leaf_reg"],
-            loss_function="Logloss",
-            eval_metric="Logloss",
-            auto_class_weights="Balanced",
-            random_seed=RANDOM_SEED,
-            verbose=False,
-            early_stopping_rounds=100,
-            cat_features=cat_features,
-        )
-        model.fit(X_train, y_train, eval_set=(X_val, y_val), use_best_model=True)
-        pred = model.predict_proba(X_val)[:, 1]
-
-        # Optimize threshold for this config
-        best_thr = 0.5
-        best_thr_f1 = 0.0
-        for thr in np.arange(0.30, 0.70, 0.01):
-            f1 = f1_score(y_val, (pred >= thr).astype(int), zero_division=0)
-            if f1 > best_thr_f1:
-                best_thr_f1 = f1
-                best_thr = float(thr)
-
-        print(f"    CB config {i+1}/8: depth={params['depth']}, lr={params['learning_rate']}, "
-              f"l2={params['l2_leaf_reg']} -> F1={best_thr_f1:.4f} @ thr={best_thr:.2f}")
-
-        if best_thr_f1 > best_f1:
-            best_f1 = best_thr_f1
-            best_params = params
-
-    print(f"  >>> Best CatBoost: depth={best_params['depth']}, lr={best_params['learning_rate']}, "
-          f"l2={best_params['l2_leaf_reg']} -> F1={best_f1:.4f}")
-    return best_params, best_f1
+    cats = [c for c in CAT_FEATURES if c in cat_features]
+    return no_id, cat_features, cats
 
 
-def tune_lightgbm(X_train, y_train, X_val, y_val, categorical_feature=None):
-    """Grid search LightGBM hyperparameters on the last CV fold.
-
-    Tries 8 combinations of num_leaves, learning_rate, and max_depth.
-    Each config is trained with 500 iterations (fast) and early stopping.
-    Returns the best params and their F1 score.
-    """
-    param_grid = [
-        {"num_leaves": 31, "learning_rate": 0.02, "max_depth": 6},
-        {"num_leaves": 31, "learning_rate": 0.05, "max_depth": 7},
-        {"num_leaves": 63, "learning_rate": 0.02, "max_depth": 6},
-        {"num_leaves": 63, "learning_rate": 0.03, "max_depth": 7},
-        {"num_leaves": 63, "learning_rate": 0.05, "max_depth": 8},
-        {"num_leaves": 127, "learning_rate": 0.02, "max_depth": 7},
-        {"num_leaves": 127, "learning_rate": 0.03, "max_depth": 8},
-        {"num_leaves": 127, "learning_rate": 0.05, "max_depth": 6},
-    ]
-
-    best_f1 = 0.0
-    best_params = param_grid[3]  # default (close to current)
-
-    for i, params in enumerate(param_grid):
-        model = lgb.LGBMClassifier(
-            n_estimators=500,
-            learning_rate=params["learning_rate"],
-            max_depth=params["max_depth"],
-            num_leaves=params["num_leaves"],
-            min_child_samples=20,
-            subsample=0.8,
-            colsample_bytree=0.8,
-            scale_pos_weight=SCALE_POS_WEIGHT,
-            objective="binary",
-            metric="auc",
-            random_state=RANDOM_SEED,
-            verbose=-1,
-        )
-        callbacks = [lgb.early_stopping(stopping_rounds=50, verbose=False)]
-        model.fit(
-            X_train, y_train,
-            eval_set=[(X_val, y_val)],
-            categorical_feature=categorical_feature,
-            callbacks=callbacks,
-        )
-        pred = model.predict_proba(X_val)[:, 1]
-
-        # Optimize threshold for this config
-        best_thr = 0.5
-        best_thr_f1 = 0.0
-        for thr in np.arange(0.30, 0.70, 0.01):
-            f1 = f1_score(y_val, (pred >= thr).astype(int), zero_division=0)
-            if f1 > best_thr_f1:
-                best_thr_f1 = f1
-                best_thr = float(thr)
-
-        print(f"    LGB config {i+1}/8: leaves={params['num_leaves']}, lr={params['learning_rate']}, "
-              f"depth={params['max_depth']} -> F1={best_thr_f1:.4f} @ thr={best_thr:.2f}")
-
-        if best_thr_f1 > best_f1:
-            best_f1 = best_thr_f1
-            best_params = params
-
-    print(f"  >>> Best LightGBM: leaves={best_params['num_leaves']}, lr={best_params['learning_rate']}, "
-          f"depth={best_params['max_depth']} -> F1={best_f1:.4f}")
-    return best_params, best_f1
 
 
-def tune_scale_pos_weight(X_tr_cb, y_tr, X_va_cb, y_va, cb_cat_features, cb_params,
-                           X_tr_lgb, X_va_lgb, lgb_cat_features, lgb_params,
-                           X_tr_xgb, X_va_xgb):
-    """Try different scale_pos_weight values for all models on the last fold.
-
-    For each spw in [3, 4, 5, 6, 7], trains all 3 models, computes ensemble F1
-    (equal-weight average), and returns the best spw and its F1.
-    CatBoost uses class_weights instead of auto_class_weights when spw is specified.
-    """
-    spw_values = [3, 4, 5, 6, 7]
-    best_spw = SCALE_POS_WEIGHT
-    best_f1 = 0.0
-
-    for spw in spw_values:
-        # CatBoost with class_weights
-        cb_model = CatBoostClassifier(
-            iterations=500,
-            learning_rate=cb_params["learning_rate"],
-            depth=cb_params["depth"],
-            l2_leaf_reg=cb_params["l2_leaf_reg"],
-            loss_function="Logloss",
-            eval_metric="Logloss",
-            class_weights={0: 1, 1: spw},
-            random_seed=RANDOM_SEED,
-            verbose=False,
-            early_stopping_rounds=100,
-            cat_features=cb_cat_features,
-        )
-        cb_model.fit(X_tr_cb, y_tr, eval_set=(X_va_cb, y_va), use_best_model=True)
-        cb_pred = cb_model.predict_proba(X_va_cb)[:, 1]
-
-        # LightGBM with scale_pos_weight
-        lgb_model = lgb.LGBMClassifier(
-            n_estimators=500,
-            learning_rate=lgb_params["learning_rate"],
-            max_depth=lgb_params["max_depth"],
-            num_leaves=lgb_params["num_leaves"],
-            min_child_samples=20,
-            subsample=0.8,
-            colsample_bytree=0.8,
-            scale_pos_weight=spw,
-            objective="binary",
-            metric="auc",
-            random_state=RANDOM_SEED,
-            verbose=-1,
-        )
-        lgb_model.fit(
-            X_tr_lgb, y_tr,
-            eval_set=[(X_va_lgb, y_va)],
-            categorical_feature=lgb_cat_features,
-            callbacks=[lgb.early_stopping(stopping_rounds=50, verbose=False)],
-        )
-        lgb_pred = lgb_model.predict_proba(X_va_lgb)[:, 1]
-
-        # XGBoost with scale_pos_weight
-        xgb_model = xgb.XGBClassifier(
-            n_estimators=500,
-            learning_rate=0.03,
-            max_depth=7,
-            subsample=0.8,
-            colsample_bytree=0.8,
-            scale_pos_weight=spw,
-            objective="binary:logistic",
-            eval_metric="logloss",
-            random_state=RANDOM_SEED,
-            early_stopping_rounds=100,
-        )
-        xgb_model.fit(X_tr_xgb, y_tr, eval_set=[(X_va_xgb, y_va)], verbose=False)
-        xgb_pred = xgb_model.predict_proba(X_va_xgb)[:, 1]
-
-        # Ensemble (equal-weight average) and threshold optimization
-        ensemble_pred = (cb_pred + lgb_pred + xgb_pred) / 3.0
-        best_thr = 0.5
-        best_thr_f1 = 0.0
-        for thr in np.arange(0.30, 0.70, 0.01):
-            f1 = f1_score(y_va, (ensemble_pred >= thr).astype(int), zero_division=0)
-            if f1 > best_thr_f1:
-                best_thr_f1 = f1
-                best_thr = float(thr)
-
-        print(f"    spw={spw} -> ensemble F1={best_thr_f1:.4f} @ thr={best_thr:.2f}")
-
-        if best_thr_f1 > best_f1:
-            best_f1 = best_thr_f1
-            best_spw = spw
-
-    print(f"  >>> Best scale_pos_weight: {best_spw} -> F1={best_f1:.4f}")
-    return best_spw, best_f1
+def prepare_features(raw_train: pd.DataFrame, raw_other: pd.DataFrame, mappings: dict):
+    train_features, other_features = make_split_features(raw_train, raw_other, mappings)
+    no_id, cat_features, cats = base_columns(train_features)
+    return train_features, other_features, no_id, cat_features, cats
 
 
-# ============================================================================
-# Section 9c: Stacking (Meta-Model on OOF Predictions)
-# ============================================================================
-
-def train_stacking_meta_model(oof_train, oof_y, oof_val, val_y, test_preds):
-    """Train meta-model on OOF predictions and evaluate on last fold.
-
-    Parameters
-    ----------
-    oof_train : np.ndarray of shape (n_train_meta, 3)
-        OOF predictions [cb, lgb, xgb] for meta-model training (folds 1-4).
-    oof_y : np.ndarray
-        Labels for meta-model training.
-    oof_val : np.ndarray of shape (n_val, 3)
-        OOF predictions [cb, lgb, xgb] for last fold (meta-model validation).
-    val_y : np.ndarray
-        Labels for last fold.
-    test_preds : np.ndarray of shape (n_test, 3)
-        Final models' test predictions [cb, lgb, xgb].
-
-    Returns
-    -------
-    dict with stacking results
-    """
-    results = {}
-
-    # --- LogisticRegression meta-model ---
-    lr_meta = LogisticRegression(C=1.0, random_state=RANDOM_SEED, max_iter=1000)
-    lr_meta.fit(oof_train, oof_y)
-    lr_val_pred = lr_meta.predict_proba(oof_val)[:, 1]
-    lr_test_pred = lr_meta.predict_proba(test_preds)[:, 1]
-
-    lr_best_thr, lr_best_f1 = optimize_threshold(val_y, lr_val_pred, "Stacking-LR last-fold")
-    results["lr"] = {"val_f1": lr_best_f1, "val_thr": lr_best_thr, "test_pred": lr_test_pred}
-
-    # --- LightGBM meta-model ---
-    lgb_meta = lgb.LGBMClassifier(
-        n_estimators=100,
-        max_depth=3,
-        learning_rate=0.1,
-        random_state=RANDOM_SEED,
-        verbose=-1,
-    )
-    lgb_meta.fit(oof_train, oof_y)
-    lgb_val_pred = lgb_meta.predict_proba(oof_val)[:, 1]
-    lgb_test_pred = lgb_meta.predict_proba(test_preds)[:, 1]
-
-    lgb_best_thr, lgb_best_f1 = optimize_threshold(val_y, lgb_val_pred, "Stacking-LGB last-fold")
-    results["lgb"] = {"val_f1": lgb_best_f1, "val_thr": lgb_best_thr, "test_pred": lgb_test_pred}
-
-    return results
+BLOCK = 7446
+THREADS = 2
+CAT_PARAMS = {
+    "cat_all": {"depth": 7, "l2_leaf_reg": 3.0, "half_life": None},
+    "cat_recent": {"depth": 7, "l2_leaf_reg": 9.0, "half_life": 105.0},
+}
+LGB_PARAMS = {
+    "lgb_neutral": {"learning_rate": 0.03, "num_leaves": 48, "min_child_samples": 35,
+                     "colsample_bytree": 0.85, "subsample": 0.85, "reg_lambda": 2.0,
+                     "scale_pos_weight": 1.0},
+    "lgb_diverse": {"learning_rate": 0.025, "num_leaves": 64, "min_child_samples": 25,
+                     "colsample_bytree": 0.85, "subsample": 0.85, "reg_lambda": 3.0,
+                     "scale_pos_weight": 2.0},
+}
+MAX_ITERATIONS_CAT = 2400
+MAX_ITERATIONS_LGB = 2000
+ES_ROUNDS = 150
+SAMPLE_F1 = 0.2347083926
+TEST_ROWS = 7446
+TEST_POSITIVES = round(TEST_ROWS * SAMPLE_F1 / (2 - SAMPLE_F1))
+RATE_MULTIPLIER = 1.8
+BLEND_WEIGHTS = {
+    "cat_all": 0.25,
+    "cat_recent": 0.25,
+    "lgb_neutral": 0.25,
+    "lgb_diverse": 0.25,
+}
+MODEL_SIZE_LIMIT_BYTES = 15 * 1024 * 1024
 
 
-# ============================================================================
-# Section 10: Final Model Training (on full train data)
-# ============================================================================
+def recency_weight(times: pd.Series, half_life: float) -> np.ndarray:
+    age_days = (times.max() - times).dt.total_seconds().to_numpy() / 86400.0
+    return np.exp(np.log(0.5) * age_days / half_life)
 
-def train_final_catboost(X, y, cat_features, n_estimators, depth=7, learning_rate=0.03,
-                          l2_leaf_reg=3, scale_pos_weight=None):
-    """Train CatBoost on full data with fixed iteration count and tuned params."""
-    if scale_pos_weight is not None:
-        kwargs = {"class_weights": {0: 1, 1: scale_pos_weight}}
-    else:
-        kwargs = {"auto_class_weights": "Balanced"}
 
+def fit_catboost(x_tr, y_tr, cats, weight, l2_leaf_reg, depth, seed, iterations, eval_set=None):
     model = CatBoostClassifier(
-        iterations=n_estimators,
-        learning_rate=learning_rate,
-        depth=depth,
-        l2_leaf_reg=l2_leaf_reg,
-        loss_function="Logloss",
-        eval_metric="Logloss",
-        random_seed=RANDOM_SEED,
-        verbose=200,
-        cat_features=cat_features,
-        **kwargs,
+        iterations=iterations, learning_rate=0.03, depth=depth,
+        l2_leaf_reg=float(l2_leaf_reg), loss_function="Logloss", eval_metric="Logloss",
+        auto_class_weights="Balanced", random_seed=int(seed), verbose=False,
+        early_stopping_rounds=ES_ROUNDS if eval_set is not None else None,
+        thread_count=THREADS, allow_writing_files=False,
     )
-    model.fit(X, y)
-    return model
+    if eval_set is None:
+        model.fit(x_tr, y_tr, cat_features=cats, sample_weight=weight)
+        return model, iterations
+    model.fit(x_tr, y_tr, cat_features=cats, sample_weight=weight,
+              eval_set=eval_set, use_best_model=True)
+    return model, int(model.get_best_iteration()) + 1
 
 
-def train_final_lightgbm(X, y, n_estimators, categorical_feature=None,
-                           num_leaves=63, learning_rate=0.03, max_depth=7,
-                           scale_pos_weight=SCALE_POS_WEIGHT):
-    """Train LightGBM on full data with fixed iteration count and tuned params."""
-    model = lgb.LGBMClassifier(
-        n_estimators=n_estimators,
-        learning_rate=learning_rate,
-        max_depth=max_depth,
-        num_leaves=num_leaves,
-        min_child_samples=20,
-        subsample=0.8,
-        colsample_bytree=0.8,
-        scale_pos_weight=scale_pos_weight,
-        objective="binary",
-        metric="auc",
-        random_state=RANDOM_SEED,
-        verbose=-1,
-    )
-    model.fit(X, y, categorical_feature=categorical_feature)
-    return model
+def fit_lightgbm(x_tr, y_tr, cats, params, seed, iterations, eval_set=None):
+    model = lgb.LGBMClassifier(n_estimators=iterations, max_depth=-1, objective="binary",
+                               random_state=int(seed), verbosity=-1, n_jobs=THREADS, **params)
+    if eval_set is None:
+        model.fit(x_tr, y_tr, categorical_feature=cats)
+        return model, iterations
+    model.fit(x_tr, y_tr, categorical_feature=cats, eval_set=eval_set,
+              callbacks=[lgb.early_stopping(ES_ROUNDS, verbose=False)])
+    return model, max(int(model.best_iteration_ or iterations), 20)
 
 
-def train_final_xgboost(X, y, n_estimators, scale_pos_weight=SCALE_POS_WEIGHT):
-    """Train XGBoost on full data with fixed iteration count (numeric features only)."""
-    model = xgb.XGBClassifier(
-        n_estimators=n_estimators,
-        learning_rate=0.03,
-        max_depth=7,
-        subsample=0.8,
-        colsample_bytree=0.8,
-        scale_pos_weight=scale_pos_weight,
-        objective="binary:logistic",
-        eval_metric="logloss",
-        random_state=RANDOM_SEED,
-    )
-    model.fit(X, y, verbose=200)
-    return model
+def build_matrices(raw_tr: pd.DataFrame, raw_va: pd.DataFrame, mappings: dict):
+    frame_tr, frame_va, no_id, cat_features, cats = prepare_features(raw_tr, raw_va, mappings)
+    x_cat_tr = prepare_cat(frame_tr, cat_features, cats)
+    x_cat_va = prepare_cat(frame_va, cat_features, cats)
+    lgb_cats = [c for c in CAT_FEATURES if c in no_id]
+    x_lgb_tr, x_lgb_va, lgb_cat_cols = encode_lgb(frame_tr, frame_va, no_id, lgb_cats)
+    y_tr = frame_tr["is_valid"].to_numpy()
+    y_va = frame_va["is_valid"].to_numpy() if "is_valid" in frame_va else None
+    return {"x_cat_tr": x_cat_tr, "x_cat_va": x_cat_va, "cats": cats,
+            "x_lgb_tr": x_lgb_tr, "x_lgb_va": x_lgb_va, "lgb_cats": lgb_cat_cols,
+            "y_tr": y_tr, "y_va": y_va}
 
 
-# ============================================================================
-# Section 10b: Feature Importance
-# ============================================================================
-
-def print_feature_importance(cb_model, lgb_model, xgb_model, feature_cols):
-    """Extract and print feature importances from all three models."""
-    print("\n" + "=" * 70)
-    print("Feature Importance Analysis (from last CV fold models)")
-    print("=" * 70)
-
-    # CatBoost
-    cb_imp = pd.DataFrame({
-        "feature": feature_cols,
-        "importance": cb_model.get_feature_importance(),
-    }).sort_values("importance", ascending=False)
-    print("\nCatBoost Top 20 Features:")
-    print(cb_imp.head(20).to_string(index=False))
-
-    # LightGBM
-    lgb_imp = pd.DataFrame({
-        "feature": feature_cols,
-        "importance": lgb_model.feature_importances_,
-    }).sort_values("importance", ascending=False)
-    print("\nLightGBM Top 20 Features:")
-    print(lgb_imp.head(20).to_string(index=False))
-
-    # XGBoost
-    xgb_imp = pd.DataFrame({
-        "feature": feature_cols,
-        "importance": xgb_model.feature_importances_,
-    }).sort_values("importance", ascending=False)
-    print("\nXGBoost Top 20 Features:")
-    print(xgb_imp.head(20).to_string(index=False))
-
-
-# ============================================================================
-# Section 10c: Adversarial Validation
-# ============================================================================
-
-def adversarial_validation(val_df, test_df, label_mappings, feature_cols):
-    """Check if validation and test distributions are similar.
-
-    Trains a LightGBM to distinguish val (label=0) from test (label=1).
-    High AUC indicates distribution shift — validation F1 may not transfer.
-    """
-    print("\n" + "=" * 70)
-    print("Adversarial Validation (last CV fold val vs test)")
-    print("=" * 70)
-
-    # Prepare features for LightGBM
-    X_val = prepare_for_lgb_xgb(val_df[feature_cols], label_mappings)
-    X_test = prepare_for_lgb_xgb(test_df[feature_cols], label_mappings)
-
-    # Convert category columns to numeric codes for consistent concatenation
-    for df_tmp in [X_val, X_test]:
-        for col in df_tmp.columns:
-            if str(df_tmp[col].dtype) == "category":
-                df_tmp[col] = df_tmp[col].cat.codes
-
-    X_combined = pd.concat([X_val, X_test], axis=0, ignore_index=True)
-    y_combined = np.concatenate([np.zeros(len(X_val)), np.ones(len(X_test))])
-
-    adv_model = lgb.LGBMClassifier(
-        n_estimators=100,
-        max_depth=5,
-        learning_rate=0.1,
-        random_state=RANDOM_SEED,
-        verbose=-1,
-    )
-    adv_model.fit(X_combined, y_combined)
-
-    adv_pred = adv_model.predict_proba(X_combined)[:, 1]
-    auc = roc_auc_score(y_combined, adv_pred)
-
-    print(f"\n  Adversarial Validation AUC: {auc:.4f}")
-
-    imp = pd.DataFrame({
-        "feature": X_combined.columns,
-        "importance": adv_model.feature_importances_,
-    }).sort_values("importance", ascending=False)
-
-    print("  Top 10 features distinguishing val from test:")
-    print(imp.head(10).to_string(index=False))
-
-    if auc > 0.7:
-        print("\n  WARNING: AUC > 0.7 — significant distribution shift detected!")
-        print("  Validation F1 may not transfer to test.")
-    else:
-        print("\n  AUC <= 0.7 — distributions are reasonably similar.")
-
-    return auc
+def component_probabilities(raw_tr, raw_va, mappings, seeds, log, model_dir=None):
+    inner_cut = max(len(raw_tr) - BLOCK, int(0.6 * len(raw_tr)))
+    inner_tr, inner_va = raw_tr.iloc[:inner_cut], raw_tr.iloc[inner_cut:]
+    inner = build_matrices(inner_tr, inner_va, mappings)
+    outer = build_matrices(raw_tr, raw_va, mappings)
+    inner_times = pd.to_datetime(inner_tr["first_event_time"])
+    outer_times = pd.to_datetime(raw_tr["first_event_time"])
+    probabilities = {}
+    if model_dir is not None:
+        model_dir.mkdir(parents=True, exist_ok=True)
+    for name, cfg in CAT_PARAMS.items():
+        w_inner = None if cfg["half_life"] is None else recency_weight(inner_times, cfg["half_life"])
+        w_outer = None if cfg["half_life"] is None else recency_weight(outer_times, cfg["half_life"])
+        started = time.time()
+        _, iterations = fit_catboost(inner["x_cat_tr"], inner["y_tr"], inner["cats"], w_inner,
+                                     cfg["l2_leaf_reg"], cfg["depth"], seeds[0], MAX_ITERATIONS_CAT,
+                                     eval_set=(inner["x_cat_va"], inner["y_va"]))
+        log[f"{name}_iterations"] = iterations
+        for seed in seeds:
+            model, _ = fit_catboost(outer["x_cat_tr"], outer["y_tr"], outer["cats"], w_outer,
+                                    cfg["l2_leaf_reg"], cfg["depth"], seed, iterations)
+            probabilities[f"{name}_s{seed}"] = model.predict_proba(outer["x_cat_va"])[:, 1]
+            if model_dir is not None:
+                model.save_model(str(model_dir / f"{name}_s{seed}.cbm"))
+        log[f"{name}_seconds"] = round(time.time() - started, 1)
+        print(f"    {name}: iterations={iterations} ({log[f'{name}_seconds']}s)", flush=True)
+    for name, params in LGB_PARAMS.items():
+        started = time.time()
+        _, iterations = fit_lightgbm(inner["x_lgb_tr"], inner["y_tr"], inner["lgb_cats"], params,
+                                     seeds[0], MAX_ITERATIONS_LGB,
+                                     eval_set=[(inner["x_lgb_va"], inner["y_va"])])
+        log[f"{name}_iterations"] = iterations
+        for seed in seeds:
+            model, _ = fit_lightgbm(outer["x_lgb_tr"], outer["y_tr"], outer["lgb_cats"], params,
+                                    seed, iterations)
+            probabilities[f"{name}_s{seed}"] = model.predict_proba(outer["x_lgb_va"])[:, 1]
+            if model_dir is not None:
+                joblib.dump(model, model_dir / f"{name}_s{seed}.pkl", compress=3)
+        log[f"{name}_seconds"] = round(time.time() - started, 1)
+        print(f"    {name}: iterations={iterations} ({log[f'{name}_seconds']}s)", flush=True)
+    return probabilities
 
 
-# ============================================================================
-# Section 11: Main Pipeline
-# ============================================================================
+def _prune_models_if_needed(model_dir: Path) -> None:
+    total_bytes = sum(path.stat().st_size for path in model_dir.iterdir() if path.is_file())
+    if total_bytes <= MODEL_SIZE_LIMIT_BYTES:
+        return
+    for path in model_dir.iterdir():
+        if path.is_file() and "_s42." not in path.name:
+            path.unlink()
+
+
+def _mean_seed_predictions(probabilities):
+    return {name: np.mean([probabilities[f"{name}_s{seed}"] for seed in (42, 2026, 777)], axis=0)
+            for name in ("cat_all", "cat_recent", "lgb_neutral", "lgb_diverse")}
+
 
 def main():
-    start_time = time.time()
-
-    # ------------------------------------------------------------------
-    # Step 1: Load data
-    # ------------------------------------------------------------------
-    train, test = load_data()
-
-    # ------------------------------------------------------------------
-    # Step 2: EDA
-    # ------------------------------------------------------------------
-    eda(train, test)
-
-    # ------------------------------------------------------------------
-    # Step 3: Compute aggregated count features (on combined train+test)
-    # ------------------------------------------------------------------
-    agg_mappings = compute_agg_counts(train, test)
-
-    # ------------------------------------------------------------------
-    # Step 4: Feature engineering
-    # ------------------------------------------------------------------
-    print("\n" + "=" * 70)
-    print("Feature engineering...")
-    print("=" * 70)
-
-    train_fe = engineer_features(train, agg_mappings)
-    test_fe = engineer_features(test, agg_mappings)
-
-    print(f"Train features shape: {train_fe.shape}")
-    print(f"Test features shape:  {test_fe.shape}")
-
-    # ------------------------------------------------------------------
-    # Step 5: Compute label encoding mappings (on combined data)
-    # ------------------------------------------------------------------
-    label_mappings = compute_label_mappings(train_fe, test_fe)
-
-    # ------------------------------------------------------------------
-    # Step 6: Full-train target encoding (K-fold for train, full-train for test)
-    # ------------------------------------------------------------------
-    print("\n" + "=" * 70)
-    print("Target encoding (K-fold for train, full-train mapping for test)...")
-    print("=" * 70)
-
-    # K-fold TE on full train (leakage-free for final model training)
-    train_full_te = kfold_target_encoding(train_fe, "is_valid", TE_ALPHA)
-    # TE from full train applied to test (correct: test labels not used)
-    test_full_te = apply_te_to_new_data(train_fe, test_fe, "is_valid", TE_ALPHA)
-    print("  K-fold target encoding complete (5-fold, leakage-free).")
-
-    # Define feature columns (all columns except is_valid)
-    feature_cols = [c for c in train_full_te.columns if c != "is_valid"]
-    n_old_features = 63  # previous version had 63 features
-    print(f"  Total features (with target encoding): {len(feature_cols)} (was {n_old_features} before new features)")
-
-    # Categorical features present in feature_cols
-    cb_cat_features = [c for c in CAT_FEATURES if c in feature_cols]
-    lgb_cat_features = [c for c in CAT_FEATURES if c in feature_cols]
-    print(f"  Categorical features: {len(cb_cat_features)} columns")
-
-    # ------------------------------------------------------------------
-    # Step 7: Prepare final model matrices
-    # ------------------------------------------------------------------
-    print("\n" + "=" * 70)
-    print("Preparing final model feature matrices...")
-    print("=" * 70)
-
-    X_train_full_cb = prepare_for_catboost(train_full_te[feature_cols])
-    X_test_cb = prepare_for_catboost(test_full_te[feature_cols])
-    X_train_full_num = prepare_for_lgb_xgb(train_full_te[feature_cols], label_mappings)
-    X_test_num = prepare_for_lgb_xgb(test_full_te[feature_cols], label_mappings)
-    # XGBoost: keep all features numeric (no category dtype) — avoids
-    # enable_categorical issues in XGBoost 2.1.4 with high-cardinality cats
-    X_train_full_xgb = prepare_for_lgb_xgb(train_full_te[feature_cols], label_mappings, cast_category=False)
-    X_test_xgb = prepare_for_lgb_xgb(test_full_te[feature_cols], label_mappings, cast_category=False)
-    y_train_full = train_full_te["is_valid"].values
-
-    print(f"  Full train (CatBoost): {X_train_full_cb.shape}")
-    print(f"  Full train (LightGBM): {X_train_full_num.shape}")
-    print(f"  Full train (XGBoost):  {X_train_full_xgb.shape}")
-    print(f"  Test (CatBoost):       {X_test_cb.shape}")
-    print(f"  Test (LightGBM):       {X_test_num.shape}")
-    print(f"  Test (XGBoost):        {X_test_xgb.shape}")
-
-    # ------------------------------------------------------------------
-    # Step 8: 5-fold TimeSeriesSplit CV with OOF predictions
-    # ------------------------------------------------------------------
-    print("\n" + "=" * 70)
-    print("5-Fold TimeSeriesSplit Cross-Validation with OOF Predictions")
-    print("=" * 70)
-
-    tscv = TimeSeriesSplit(n_splits=5)
-
-    # OOF storage
-    oof_cb = np.zeros(len(train_fe))
-    oof_lgb = np.zeros(len(train_fe))
-    oof_xgb = np.zeros(len(train_fe))
-    oof_mask = np.zeros(len(train_fe), dtype=bool)
-
-    # Track best iterations across folds
-    all_cb_best = []
-    all_lgb_best = []
-    all_xgb_best = []
-
-    # Store last fold's models and data for feature importance & adversarial validation
-    last_cb_model = None
-    last_lgb_model = None
-    last_xgb_model = None
-    last_val_fold_te = None
-
-    for fold, (train_idx, val_idx) in enumerate(tscv.split(train_fe), 1):
-        print(f"\n--- Fold {fold}/5 ---")
-        print(f"  Train: {len(train_idx)} rows | Val: {len(val_idx)} rows")
-
-        train_fold = train_fe.iloc[train_idx].copy()
-        val_fold = train_fe.iloc[val_idx].copy()
-
-        # K-fold TE on train_fold (leakage-free), apply TE from train_fold to val_fold
-        train_fold_te = kfold_target_encoding(train_fold, "is_valid", TE_ALPHA)
-        val_fold_te = apply_te_to_new_data(train_fold, val_fold, "is_valid", TE_ALPHA)
-
-        # Prepare matrices
-        X_tr_cb = prepare_for_catboost(train_fold_te[feature_cols])
-        X_va_cb = prepare_for_catboost(val_fold_te[feature_cols])
-        X_tr_num = prepare_for_lgb_xgb(train_fold_te[feature_cols], label_mappings)
-        X_va_num = prepare_for_lgb_xgb(val_fold_te[feature_cols], label_mappings)
-        # XGBoost: numeric only (no category dtype)
-        X_tr_xgb = prepare_for_lgb_xgb(train_fold_te[feature_cols], label_mappings, cast_category=False)
-        X_va_xgb = prepare_for_lgb_xgb(val_fold_te[feature_cols], label_mappings, cast_category=False)
-
-        y_tr = train_fold_te["is_valid"].values
-        y_va = val_fold_te["is_valid"].values
-
-        # Train models (quiet during CV to reduce output)
-        cb_model = train_catboost(X_tr_cb, y_tr, X_va_cb, y_val=y_va, cat_features=cb_cat_features, quiet=True)
-        lgb_model = train_lightgbm(X_tr_num, y_tr, X_va_num, y_val=y_va, categorical_feature=lgb_cat_features, quiet=True)
-        xgb_model = train_xgboost(X_tr_xgb, y_tr, X_va_xgb, y_val=y_va, quiet=True)
-
-        # Predict on validation
-        cb_pred = cb_model.predict_proba(X_va_cb)[:, 1]
-        lgb_pred = lgb_model.predict_proba(X_va_num)[:, 1]
-        xgb_pred = xgb_model.predict_proba(X_va_xgb)[:, 1]
-
-        oof_cb[val_idx] = cb_pred
-        oof_lgb[val_idx] = lgb_pred
-        oof_xgb[val_idx] = xgb_pred
-        oof_mask[val_idx] = True
-
-        # Per-fold F1 at default threshold 0.5
-        cb_f1_fold = f1_score(y_va, (cb_pred >= 0.5).astype(int), zero_division=0)
-        lgb_f1_fold = f1_score(y_va, (lgb_pred >= 0.5).astype(int), zero_division=0)
-        xgb_f1_fold = f1_score(y_va, (xgb_pred >= 0.5).astype(int), zero_division=0)
-
-        # Best iterations
-        cb_best, lgb_best, xgb_best = get_best_iterations(cb_model, lgb_model, xgb_model, quiet=True)
-        all_cb_best.append(cb_best)
-        all_lgb_best.append(lgb_best)
-        all_xgb_best.append(xgb_best)
-
-        print(f"  F1@0.5 — CatBoost: {cb_f1_fold:.4f}, LightGBM: {lgb_f1_fold:.4f}, XGBoost: {xgb_f1_fold:.4f}")
-        print(f"  Best iters — CB: {cb_best}, LGB: {lgb_best}, XGB: {xgb_best}")
-
-        # Save last fold's models and data (for feature importance, adversarial validation, and tuning)
-        if fold == 5:
-            last_cb_model = cb_model
-            last_lgb_model = lgb_model
-            last_xgb_model = xgb_model
-            last_val_fold_te = val_fold_te
-            last_y_va = y_va
-            last_cb_pred = cb_pred
-            last_lgb_pred = lgb_pred
-            last_xgb_pred = xgb_pred
-            # Save training data for hyperparameter tuning
-            last_X_tr_cb = X_tr_cb
-            last_X_va_cb = X_va_cb
-            last_X_tr_num = X_tr_num
-            last_X_va_num = X_va_num
-            last_X_tr_xgb = X_tr_xgb
-            last_X_va_xgb = X_va_xgb
-            last_y_tr = y_tr
-            last_val_idx = val_idx
-
-    # ------------------------------------------------------------------
-    # Step 9: Pooled OOF predictions — threshold & ensemble optimization
-    # ------------------------------------------------------------------
-    print("\n" + "=" * 70)
-    print("Pooled OOF Predictions — Threshold & Ensemble Optimization")
-    print("=" * 70)
-
-    pooled_y = train_fe["is_valid"].values[oof_mask]
-    pooled_cb = oof_cb[oof_mask]
-    pooled_lgb = oof_lgb[oof_mask]
-    pooled_xgb = oof_xgb[oof_mask]
-
-    print(f"  Total OOF predictions: {len(pooled_y)}")
-
-    # Individual model OOF threshold optimization
-    print("\n  Individual model OOF threshold optimization (0.05 - 0.95, step 0.01):")
-    cb_thr, cb_oof_f1 = optimize_threshold(pooled_y, pooled_cb, "CatBoost OOF")
-    lgb_thr, lgb_oof_f1 = optimize_threshold(pooled_y, pooled_lgb, "LightGBM OOF")
-    xgb_thr, xgb_oof_f1 = optimize_threshold(pooled_y, pooled_xgb, "XGBoost OOF")
-
-    print(f"\n  {'Model':27s} | {'Best F1':8s} | {'Threshold':10s}")
-    print(f"  {'-' * 27}-+-{'-' * 8}-+-{'-' * 10}")
-    print(f"  {'CatBoost':27s} | {cb_oof_f1:.4f}   | {cb_thr:.2f}")
-    print(f"  {'LightGBM':27s} | {lgb_oof_f1:.4f}   | {lgb_thr:.2f}")
-    print(f"  {'XGBoost':27s} | {xgb_oof_f1:.4f}   | {xgb_thr:.2f}")
-
-    # Ensemble optimization (weighted grid search)
-    print("\n  Ensemble optimization: weighted grid search over (w_cat, w_lgb, w_xgb)...")
-    print("  Weights range 0.0-1.0 step 0.1, sum to 1.0; threshold 0.05-0.95 step 0.01")
-
-    oof_preds_dict = {"catboost": pooled_cb, "lightgbm": pooled_lgb, "xgboost": pooled_xgb}
-    best_weights, best_thr_prob, best_f1_prob, top_configs = optimize_ensemble(oof_preds_dict, pooled_y)
-
-    print(f"\n  Top 5 weight combinations (probability averaging):")
-    print(f"  {'Rank':4s} | {'CatBoost':8s} {'LightGBM':8s} {'XGBoost':8s} | {'F1':6s} | {'Threshold':9s}")
-    print(f"  {'-' * 4}-+-{'-' * 8}-{'-' * 8}-{'-' * 8}-+-{'-' * 6}-+-{'-' * 9}")
-    for rank, (w, thr, f1) in enumerate(top_configs, 1):
-        print(f"  {rank:4d} | {w['catboost']:8.1f} {w['lightgbm']:8.1f} {w['xgboost']:8.1f} | {f1:.4f} | {thr:.2f}")
-
-    print(f"\n  >>> Best probability-averaging config: "
-          f"w_cat={best_weights['catboost']:.1f}, "
-          f"w_lgb={best_weights['lightgbm']:.1f}, "
-          f"w_xgb={best_weights['xgboost']:.1f} | "
-          f"F1={best_f1_prob:.4f} | threshold={best_thr_prob:.2f}")
-
-    # Rank averaging alternative
-    print("\n  Rank averaging alternative:")
-    rank_oof_proba = rank_average(oof_preds_dict)
-    rank_thr, rank_f1 = optimize_threshold(pooled_y, rank_oof_proba, "Rank Average OOF")
-
-    print(f"\n  Rank-averaged OOF F1: {rank_f1:.4f} (threshold={rank_thr:.2f})")
-
-    # Compare probability averaging vs rank averaging
-    use_rank = rank_f1 > best_f1_prob
-    if use_rank:
-        print(f"\n  >>> Rank averaging ({rank_f1:.4f}) BEATS probability averaging ({best_f1_prob:.4f})")
-        final_method = "rank_average"
-        final_ens_f1 = rank_f1
-        final_thr = rank_thr
-    else:
-        print(f"\n  >>> Probability averaging ({best_f1_prob:.4f}) BEATS rank averaging ({rank_f1:.4f})")
-        final_method = "probability_average"
-        final_ens_f1 = best_f1_prob
-        final_thr = best_thr_prob
-
-    print(f"  >>> Selected ensemble method: {final_method}")
-    print(f"  >>> Selected ensemble OOF F1: {final_ens_f1:.4f} (threshold={final_thr:.2f})")
-
-    # ------------------------------------------------------------------
-    # Step 9b: Last-fold comparison (most representative of test conditions)
-    # ------------------------------------------------------------------
-    print("\n" + "=" * 70)
-    print("Last-Fold Optimization Comparison (most representative of test)")
-    print("=" * 70)
-    print("  (The last fold has the most training data, closest to the final model.)\n")
-
-    print("  Individual model last-fold threshold optimization:")
-    lf_cb_thr, lf_cb_f1 = optimize_threshold(last_y_va, last_cb_pred, "CatBoost last-fold")
-    lf_lgb_thr, lf_lgb_f1 = optimize_threshold(last_y_va, last_lgb_pred, "LightGBM last-fold")
-    lf_xgb_thr, lf_xgb_f1 = optimize_threshold(last_y_va, last_xgb_pred, "XGBoost last-fold")
-
-    print(f"\n  {'Model':27s} | {'Pooled F1':10s} | {'Last-fold F1':12s} | {'Pooled Thr':10s} | {'LF Thr':8s}")
-    print(f"  {'-' * 27}-+-{'-' * 10}-+-{'-' * 12}-+-{'-' * 10}-+-{'-' * 8}")
-    print(f"  {'CatBoost':27s} | {cb_oof_f1:.4f}     | {lf_cb_f1:.4f}       | {cb_thr:.2f}        | {lf_cb_thr:.2f}")
-    print(f"  {'LightGBM':27s} | {lgb_oof_f1:.4f}     | {lf_lgb_f1:.4f}       | {lgb_thr:.2f}        | {lf_lgb_thr:.2f}")
-    print(f"  {'XGBoost':27s} | {xgb_oof_f1:.4f}     | {lf_xgb_f1:.4f}       | {xgb_thr:.2f}        | {lf_xgb_thr:.2f}")
-
-    # Ensemble optimization on last fold only
-    print("\n  Ensemble optimization on last fold only:")
-    lf_preds_dict = {"catboost": last_cb_pred, "lightgbm": last_lgb_pred, "xgboost": last_xgb_pred}
-    lf_best_weights, lf_best_thr, lf_best_f1, lf_top_configs = optimize_ensemble(lf_preds_dict, last_y_va)
-
-    print(f"\n  Last-fold top 5 weight combinations:")
-    print(f"  {'Rank':4s} | {'CatBoost':8s} {'LightGBM':8s} {'XGBoost':8s} | {'F1':6s} | {'Threshold':9s}")
-    print(f"  {'-' * 4}-+-{'-' * 8}-{'-' * 8}-{'-' * 8}-+-{'-' * 6}-+-{'-' * 9}")
-    for rank, (w, thr, f1) in enumerate(lf_top_configs, 1):
-        print(f"  {rank:4d} | {w['catboost']:8.1f} {w['lightgbm']:8.1f} {w['xgboost']:8.1f} | {f1:.4f} | {thr:.2f}")
-
-    print(f"\n  Last-fold ensemble best: F1={lf_best_f1:.4f}, threshold={lf_best_thr:.2f}, "
-          f"weights=(cat={lf_best_weights['catboost']:.1f}, lgb={lf_best_weights['lightgbm']:.1f}, xgb={lf_best_weights['xgboost']:.1f})")
-
-    # Rank averaging alternative on last fold
-    print("\n  Rank averaging alternative (last fold):")
-    lf_rank_proba = rank_average(lf_preds_dict)
-    lf_rank_thr, lf_rank_f1 = optimize_threshold(last_y_va, lf_rank_proba, "Rank Average last-fold")
-    print(f"\n  Last-fold rank-averaged F1: {lf_rank_f1:.4f} (threshold={lf_rank_thr:.2f})")
-
-    # Select best last-fold method (rank vs probability averaging)
-    lf_use_rank = lf_rank_f1 > lf_best_f1
-    if lf_use_rank:
-        print(f"\n  >>> Last-fold: Rank averaging ({lf_rank_f1:.4f}) BEATS probability averaging ({lf_best_f1:.4f})")
-        submission_method = "rank_average"
-        submission_ens_f1 = lf_rank_f1
-        submission_thr = lf_rank_thr
-    else:
-        print(f"\n  >>> Last-fold: Probability averaging ({lf_best_f1:.4f}) BEATS rank averaging ({lf_rank_f1:.4f})")
-        submission_method = "probability_average"
-        submission_ens_f1 = lf_best_f1
-        submission_thr = lf_best_thr
-    submission_weights = lf_best_weights  # used for probability averaging; kept for logging
-
-    # --- Comparison: pooled OOF vs last-fold ---
-    print(f"\n  {'=' * 68}")
-    print(f"  COMPARISON: Pooled OOF vs Last-Fold (for final submission)")
-    print(f"  {'=' * 68}")
-    print(f"  Pooled OOF:  F1={final_ens_f1:.4f}, threshold={final_thr:.2f}, method={final_method}, "
-          f"weights=(cat={best_weights['catboost']:.1f}, lgb={best_weights['lightgbm']:.1f}, xgb={best_weights['xgboost']:.1f})")
-    print(f"  Last-fold:   F1={submission_ens_f1:.4f}, threshold={submission_thr:.2f}, method={submission_method}, "
-          f"weights=(cat={submission_weights['catboost']:.1f}, lgb={submission_weights['lightgbm']:.1f}, xgb={submission_weights['xgboost']:.1f})")
-    print(f"\n  >>> Using LAST-FOLD weights for final submission: "
-          f"cat={submission_weights['catboost']:.1f}, "
-          f"lgb={submission_weights['lightgbm']:.1f}, "
-          f"xgb={submission_weights['xgboost']:.1f}, "
-          f"threshold={submission_thr:.4f}")
-    print(f"  (Last fold is most representative of test: most training data, temporally closest.)")
-
-    # ------------------------------------------------------------------
-    # Step 10: Feature importance (from last CV fold's models)
-    # ------------------------------------------------------------------
-    print_feature_importance(last_cb_model, last_lgb_model, last_xgb_model, feature_cols)
-
-    # ------------------------------------------------------------------
-    # Step 11: Adversarial validation (last fold val vs test)
-    # ------------------------------------------------------------------
-    adv_auc = adversarial_validation(last_val_fold_te, test_full_te, label_mappings, feature_cols)
-
-    # ------------------------------------------------------------------
-    # Step 12: Train final models on FULL training data
-    # ------------------------------------------------------------------
-    print("\n" + "=" * 70)
-    print("Training FINAL models on full training data...")
-    print("=" * 70)
-
-    # Use best_iteration from the LAST fold (most training data, most representative)
-    cb_best_final = all_cb_best[-1]
-    lgb_best_final = all_lgb_best[-1]
-    xgb_best_final = all_xgb_best[-1]
-    print(f"  Using best iterations from last fold: CB={cb_best_final}, LGB={lgb_best_final}, XGB={xgb_best_final}")
-
-    print("\n--- Final CatBoost ---")
-    cb_final = train_final_catboost(X_train_full_cb, y_train_full, cb_cat_features, cb_best_final)
-
-    print("\n--- Final LightGBM ---")
-    lgb_final = train_final_lightgbm(X_train_full_num, y_train_full, lgb_best_final, categorical_feature=lgb_cat_features)
-
-    print("\n--- Final XGBoost ---")
-    xgb_final = train_final_xgboost(X_train_full_xgb, y_train_full, xgb_best_final)
-
-    # ------------------------------------------------------------------
-    # Step 13: Predict on test set and generate submission
-    # ------------------------------------------------------------------
-    print("\n" + "=" * 70)
-    print("Generating test predictions and submission...")
-    print("=" * 70)
-
-    cb_test_proba = cb_final.predict_proba(X_test_cb)[:, 1]
-    lgb_test_proba = lgb_final.predict_proba(X_test_num)[:, 1]
-    xgb_test_proba = xgb_final.predict_proba(X_test_xgb)[:, 1]
-
-    test_preds_dict = {
-        "catboost": cb_test_proba,
-        "lightgbm": lgb_test_proba,
-        "xgboost": xgb_test_proba,
-    }
-
-    # Apply selected ensemble method using LAST-FOLD weights/threshold
-    print(f"\n  Using LAST-FOLD configuration for test predictions:")
-    print(f"    Method: {submission_method}")
-    if submission_method == "probability_average":
-        print(f"    Weights: cat={submission_weights['catboost']:.1f}, "
-              f"lgb={submission_weights['lightgbm']:.1f}, "
-              f"xgb={submission_weights['xgboost']:.1f}")
-    print(f"    Base threshold: {submission_thr:.4f}")
-
-    if lf_use_rank:
-        ensemble_test_proba = rank_average(test_preds_dict)
-    else:
-        ensemble_test_proba = np.zeros_like(cb_test_proba)
-        for name in test_preds_dict:
-            ensemble_test_proba += submission_weights[name] * test_preds_dict[name]
-
-    # --- Positive-rate calibration (on top of last-fold threshold) ---
-    # The last-fold threshold may produce too many positive predictions
-    # relative to the train positive rate. If the deviation exceeds 20%,
-    # adjust the threshold using a percentile-based (top-K) approach.
-    train_rate = y_train_full.mean()
-    original_preds = (ensemble_test_proba >= submission_thr).astype(int)
-    original_rate = original_preds.mean()
-
-    print(f"\n  Positive-rate calibration check (on top of last-fold threshold):")
-    print(f"    Train positive rate:      {train_rate:.4f}")
-    print(f"    Predicted positive rate:  {original_rate:.4f} (at last-fold threshold {submission_thr:.4f})")
-
-    if abs(original_rate - train_rate) / train_rate > 0.20:
-        # Calibrate: use percentile-based threshold
-        # Allow up to 10% more positives than train rate (test may be slightly higher)
-        target_rate = min(1.1 * train_rate, 0.18)
-        n_positive_adjusted = int(target_rate * len(ensemble_test_proba))
-        calibrated_threshold = float(np.sort(ensemble_test_proba)[::-1][n_positive_adjusted])
-        print(f"    Rate calibration TRIGGERED: original_rate={original_rate:.4f}, target_rate={target_rate:.4f}")
-        print(f"    Threshold adjusted: {submission_thr:.4f} -> {calibrated_threshold:.4f}")
-        final_threshold = calibrated_threshold
-    else:
-        print(f"    Rate calibration NOT triggered (within 20% of train rate)")
-        final_threshold = submission_thr
-
-    ensemble_test_pred = (ensemble_test_proba >= final_threshold).astype(int)
-
-    # Create submission
-    submission = pd.DataFrame({
-        "claim_id": test["claim_id"].values,
-        "is_valid": ensemble_test_pred,
-    })
-    submission.to_csv("submission.csv", index=False)
-
-    print(f"\n  Submission saved to: submission.csv")
-    print(f"  Submission shape: {submission.shape}")
-    print(f"  >>> FINAL SUBMISSION uses LAST-FOLD configuration <<<")
-    print(f"  Ensemble method used: {submission_method}")
-    if submission_method == "probability_average":
-        print(f"  Weights: catboost={submission_weights['catboost']:.1f}, "
-              f"lightgbm={submission_weights['lightgbm']:.1f}, "
-              f"xgboost={submission_weights['xgboost']:.1f}")
-    print(f"  Last-fold threshold: {submission_thr:.4f}")
-    print(f"  Final threshold:     {final_threshold:.4f} (after rate calibration)")
-    print(f"  Prediction distribution:")
-    print(f"    is_valid=0 (rejected): {(submission['is_valid'] == 0).sum()} "
-          f"({(submission['is_valid'] == 0).mean():.2%})")
-    print(f"    is_valid=1 (valid):    {(submission['is_valid'] == 1).sum()} "
-          f"({(submission['is_valid'] == 1).mean():.2%})")
-
-    # ------------------------------------------------------------------
-    # Step 14: Experiment history logging
-    # ------------------------------------------------------------------
-    print("\n" + "=" * 70)
-    print("Logging experiment results...")
-    print("=" * 70)
-
-    experiment_log = {
-        "timestamp": datetime.datetime.now().isoformat(),
-        "random_seed": RANDOM_SEED,
-        "cv_folds": 5,
-        "catboost_oof_f1": float(cb_oof_f1),
-        "lightgbm_oof_f1": float(lgb_oof_f1),
-        "xgboost_oof_f1": float(xgb_oof_f1),
-        # Pooled OOF ensemble (for comparison)
-        "pooled_oof_ensemble_f1": float(final_ens_f1),
-        "pooled_oof_method": final_method,
-        "pooled_oof_threshold": float(final_thr),
-        "pooled_oof_weights": {k: float(v) for k, v in best_weights.items()},
-        # Last-fold ensemble (used for final submission)
-        "last_fold_ensemble_f1": float(submission_ens_f1),
-        "last_fold_method": submission_method,
-        "last_fold_threshold": float(submission_thr),
-        "last_fold_weights": {k: float(v) for k, v in submission_weights.items()},
-        # Final submission config
-        "final_config_used": "last_fold",
-        "final_threshold": float(final_threshold),
-        "rate_calibration_triggered": bool(abs(original_rate - train_rate) / train_rate > 0.20),
-        "n_features": len(feature_cols),
-        "submission_positive_rate": float(submission["is_valid"].mean()),
-        "train_positive_rate": float(train_rate),
-        "adversarial_auc": float(adv_auc),
-    }
-    with open("experiment_history.jsonl", "a") as f:
-        f.write(json.dumps(experiment_log) + "\n")
-    print("  Experiment logged to experiment_history.jsonl")
-
-    # ------------------------------------------------------------------
-    # Summary
-    # ------------------------------------------------------------------
-    total_time = time.time() - start_time
-    print("\n" + "=" * 70)
-    print("SUMMARY")
-    print("=" * 70)
-    print(f"  CV: 5-fold TimeSeriesSplit with OOF predictions ({int(oof_mask.sum())} pooled)")
-    print(f"  Pooled OOF F1 scores (individual models):")
-    print(f"    CatBoost:  {cb_oof_f1:.4f} (threshold={cb_thr:.2f})")
-    print(f"    LightGBM:  {lgb_oof_f1:.4f} (threshold={lgb_thr:.2f})")
-    print(f"    XGBoost:   {xgb_oof_f1:.4f} (threshold={xgb_thr:.2f})")
-    print(f"  --- Ensemble optimization (both strategies, for comparison) ---")
-    print(f"  Pooled OOF ensemble:")
-    print(f"    F1={final_ens_f1:.4f}, method={final_method}, threshold={final_thr:.4f}, "
-          f"weights=(cat={best_weights['catboost']:.1f}, lgb={best_weights['lightgbm']:.1f}, xgb={best_weights['xgboost']:.1f})")
-    print(f"  Last-fold ensemble:")
-    print(f"    F1={submission_ens_f1:.4f}, method={submission_method}, threshold={submission_thr:.4f}, "
-          f"weights=(cat={submission_weights['catboost']:.1f}, lgb={submission_weights['lightgbm']:.1f}, xgb={submission_weights['xgboost']:.1f})")
-    print(f"  >>> FINAL SUBMISSION uses LAST-FOLD configuration (most representative of test)")
-    print(f"  Adversarial validation AUC: {adv_auc:.4f}")
-    print(f"  Rate calibration triggered: {abs(original_rate - train_rate) / train_rate > 0.20}")
-    print(f"  Submission threshold: {final_threshold:.4f} (last-fold base: {submission_thr:.4f})")
-    print(f"  Submission predictions:")
-    print(f"    Total: {len(submission)}")
-    print(f"    Valid (1):    {(submission['is_valid'] == 1).sum()}")
-    print(f"    Rejected (0): {(submission['is_valid'] == 0).sum()}")
-    print(f"  Positive rate: {submission['is_valid'].mean():.2%}")
-    print(f"  (Train positive rate was: {train['is_valid'].mean():.2%})")
-    print(f"  Total runtime: {total_time / 60:.1f} minutes ({total_time:.0f} seconds)")
-    print("=" * 70)
-    print("Done!")
+    """Train all final components and write submission.csv.
+
+    Complete model sets are reproduced by rerunning this script; if compressed
+    persistence exceeds 15 MiB, only seed 42 models are retained.
+    """
+    train = pd.read_csv(ROOT / "train.csv").sort_values("first_event_time").reset_index(drop=True)
+    test = pd.read_csv(ROOT / "test.csv")
+    mappings = compute_agg_counts(train, test)
+    log = {"rows_train": len(train), "rows_test": len(test), "seeds": [42, 2026, 777]}
+    print("FINAL: full train -> test.csv", flush=True)
+    probabilities = component_probabilities(train, test, mappings, log["seeds"], log, ROOT / "models")
+    _prune_models_if_needed(ROOT / "models")
+    means = _mean_seed_predictions(probabilities)
+    np.savez_compressed(ROOT / "artifacts" / "probs_test_reproduced.npz",
+                        claim_id=test["claim_id"].to_numpy(), **means)
+    blend = sum(means[name] * BLEND_WEIGHTS[name] for name in BLEND_WEIGHTS)
+    # RATE_MULTIPLIER was selected on temporal CV (see src/rate_curve.py);
+    # TEST_POSITIVES is inferred from the organizers' all-ones sample_f1.
+    k = round(RATE_MULTIPLIER * TEST_POSITIVES)
+    order = np.argsort(-blend, kind="mergesort")
+    labels = np.zeros(len(blend), dtype=int)
+    labels[order[:k]] = 1
+    pd.DataFrame({"claim_id": test["claim_id"], "is_valid": labels}).to_csv(ROOT / "submission.csv", index=False)
+    (ROOT / "artifacts" / "solution_final_log.json").write_text(json.dumps(log, indent=2), encoding="utf-8")
+    print(json.dumps(log, indent=2))
+    print(f"submission.csv written with positives={int(labels.sum())}, k={k}")
 
 
 if __name__ == "__main__":

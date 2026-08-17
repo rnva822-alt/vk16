@@ -1,0 +1,24 @@
+{
+  "fold": 3,
+  "rows_train": 26320,
+  "rows_val": 7446,
+  "val_start": "2025-10-12 16:50:00",
+  "val_stop": "2025-11-27 17:06:00",
+  "prevalence_train": 0.1403115501519757,
+  "prevalence_val": 0.14356701584743486,
+  "seeds": [
+    42,
+    2026,
+    777
+  ],
+  "cat_all_iterations": 419,
+  "cat_all_seconds": 54.9,
+  "cat_recent_iterations": 354,
+  "cat_recent_seconds": 46.1,
+  "lgb_neutral_iterations": 143,
+  "lgb_neutral_seconds": 3.1,
+  "lgb_diverse_iterations": 371,
+  "lgb_diverse_seconds": 7.3,
+  "lgb_strong_iterations": 20,
+  "lgb_strong_seconds": 1.1
+}

@@ -1,0 +1,17 @@
+{
+  "rows_train": 48658,
+  "rows_test": 7446,
+  "seeds": [
+    42,
+    2026,
+    777
+  ],
+  "cat_all_iterations": 362,
+  "cat_all_seconds": 77.3,
+  "cat_recent_iterations": 382,
+  "cat_recent_seconds": 83.4,
+  "lgb_neutral_iterations": 432,
+  "lgb_neutral_seconds": 10.3,
+  "lgb_diverse_iterations": 1483,
+  "lgb_diverse_seconds": 31.3
+}

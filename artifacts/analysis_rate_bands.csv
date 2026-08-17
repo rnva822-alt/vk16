@@ -1,0 +1,101 @@
+variant,fold,band,rows,precision
+champion 0.70/0.20/0.10,1,0.0-1.44,1574,0.3723
+champion 0.70/0.20/0.10,1,1.44-1.6,175,0.2114
+champion 0.70/0.20/0.10,1,1.6-1.8,218,0.156
+champion 0.70/0.20/0.10,1,1.8-2.0,219,0.1735
+champion 0.70/0.20/0.10,1,2.0-2.2,219,0.1461
+champion 0.70/0.20/0.10,2,0.0-1.44,1624,0.3498
+champion 0.70/0.20/0.10,2,1.44-1.6,181,0.2486
+champion 0.70/0.20/0.10,2,1.6-1.8,225,0.2622
+champion 0.70/0.20/0.10,2,1.8-2.0,226,0.2124
+champion 0.70/0.20/0.10,2,2.0-2.2,226,0.1593
+champion 0.70/0.20/0.10,3,0.0-1.44,1539,0.3405
+champion 0.70/0.20/0.10,3,1.44-1.6,171,0.2281
+champion 0.70/0.20/0.10,3,1.6-1.8,214,0.2523
+champion 0.70/0.20/0.10,3,1.8-2.0,214,0.229
+champion 0.70/0.20/0.10,3,2.0-2.2,214,0.2103
+champion 0.70/0.20/0.10,4,0.0-1.44,1362,0.3363
+champion 0.70/0.20/0.10,4,1.44-1.6,152,0.2632
+champion 0.70/0.20/0.10,4,1.6-1.8,189,0.2328
+champion 0.70/0.20/0.10,4,1.8-2.0,189,0.1799
+champion 0.70/0.20/0.10,4,2.0-2.2,189,0.1746
+equal 4 components,1,0.0-1.44,1574,0.3748
+equal 4 components,1,1.44-1.6,175,0.1714
+equal 4 components,1,1.6-1.8,218,0.2064
+equal 4 components,1,1.8-2.0,219,0.1918
+equal 4 components,1,2.0-2.2,219,0.137
+equal 4 components,2,0.0-1.44,1624,0.351
+equal 4 components,2,1.44-1.6,181,0.2376
+equal 4 components,2,1.6-1.8,225,0.24
+equal 4 components,2,1.8-2.0,226,0.2301
+equal 4 components,2,2.0-2.2,226,0.1681
+equal 4 components,3,0.0-1.44,1539,0.3476
+equal 4 components,3,1.44-1.6,171,0.2164
+equal 4 components,3,1.6-1.8,214,0.2477
+equal 4 components,3,1.8-2.0,214,0.2056
+equal 4 components,3,2.0-2.2,214,0.1916
+equal 4 components,4,0.0-1.44,1362,0.3429
+equal 4 components,4,1.44-1.6,152,0.2237
+equal 4 components,4,1.6-1.8,189,0.254
+equal 4 components,4,1.8-2.0,189,0.1852
+equal 4 components,4,2.0-2.2,189,0.1376
+equal 5 components,1,0.0-1.44,1574,0.3755
+equal 5 components,1,1.44-1.6,175,0.1657
+equal 5 components,1,1.6-1.8,218,0.211
+equal 5 components,1,1.8-2.0,219,0.1644
+equal 5 components,1,2.0-2.2,219,0.1507
+equal 5 components,2,0.0-1.44,1624,0.3491
+equal 5 components,2,1.44-1.6,181,0.2155
+equal 5 components,2,1.6-1.8,225,0.28
+equal 5 components,2,1.8-2.0,226,0.1991
+equal 5 components,2,2.0-2.2,226,0.1903
+equal 5 components,3,0.0-1.44,1539,0.345
+equal 5 components,3,1.44-1.6,171,0.1988
+equal 5 components,3,1.6-1.8,214,0.2617
+equal 5 components,3,1.8-2.0,214,0.2336
+equal 5 components,3,2.0-2.2,214,0.1916
+equal 5 components,4,0.0-1.44,1362,0.3421
+equal 5 components,4,1.44-1.6,152,0.2303
+equal 5 components,4,1.6-1.8,189,0.2116
+equal 5 components,4,1.8-2.0,189,0.2381
+equal 5 components,4,2.0-2.2,189,0.1693
+rank-average 4 components,1,0.0-1.44,1574,0.3729
+rank-average 4 components,1,1.44-1.6,175,0.1771
+rank-average 4 components,1,1.6-1.8,218,0.2064
+rank-average 4 components,1,1.8-2.0,219,0.1963
+rank-average 4 components,1,2.0-2.2,219,0.1279
+rank-average 4 components,2,0.0-1.44,1624,0.3504
+rank-average 4 components,2,1.44-1.6,181,0.232
+rank-average 4 components,2,1.6-1.8,225,0.2578
+rank-average 4 components,2,1.8-2.0,226,0.2035
+rank-average 4 components,2,2.0-2.2,226,0.1903
+rank-average 4 components,3,0.0-1.44,1539,0.347
+rank-average 4 components,3,1.44-1.6,171,0.2398
+rank-average 4 components,3,1.6-1.8,214,0.2336
+rank-average 4 components,3,1.8-2.0,214,0.2196
+rank-average 4 components,3,2.0-2.2,214,0.1776
+rank-average 4 components,4,0.0-1.44,1362,0.3429
+rank-average 4 components,4,1.44-1.6,152,0.2303
+rank-average 4 components,4,1.6-1.8,189,0.2434
+rank-average 4 components,4,1.8-2.0,189,0.2011
+rank-average 4 components,4,2.0-2.2,189,0.1429
+rank-average champion,1,0.0-1.44,1574,0.3729
+rank-average champion,1,1.44-1.6,175,0.2114
+rank-average champion,1,1.6-1.8,218,0.156
+rank-average champion,1,1.8-2.0,219,0.1826
+rank-average champion,1,2.0-2.2,219,0.1416
+rank-average champion,2,0.0-1.44,1624,0.3553
+rank-average champion,2,1.44-1.6,181,0.221
+rank-average champion,2,1.6-1.8,225,0.2444
+rank-average champion,2,1.8-2.0,226,0.2035
+rank-average champion,2,2.0-2.2,226,0.177
+rank-average champion,3,0.0-1.44,1539,0.3405
+rank-average champion,3,1.44-1.6,171,0.2456
+rank-average champion,3,1.6-1.8,214,0.2477
+rank-average champion,3,1.8-2.0,214,0.2196
+rank-average champion,3,2.0-2.2,214,0.215
+rank-average champion,4,0.0-1.44,1362,0.3399
+rank-average champion,4,1.44-1.6,152,0.2434
+rank-average champion,4,1.6-1.8,189,0.2275
+rank-average champion,4,1.8-2.0,189,0.1799
+rank-average champion,4,2.0-2.2,189,0.1905
